@@ -1,0 +1,257 @@
+// ===== CÓDIGO v2.0.11 - RELES CAMBIADOS A PINES 6 Y 7 =====
+#include "thingProperties.h"
+#include "arduino_secrets.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_GrayOLED.h> 
+#include <Adafruit_SSD1306.h>
+#include <Servo.h>
+#include "DHT.h"
+#include <avr/pgmspace.h>
+#include <WiFiNINA.h>
+
+// --- Configuraciones Pantalla OLED ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define SCREEN_I2C_ADDRESS 0x3C
+#define OLED_RESET_PIN -1
+Adafruit_SSD1306 screen(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET_PIN);
+
+// --- Sensor DHT11 ---
+#define DHTPIN 10
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// --- Servos ---
+Servo servoMotor1;
+Servo servoMotor2;
+
+// --- Pines ---
+const int soilSensorPin = 5, photocellPin = A2;
+const int pumpRelayPin = 6; // ANTES: 4
+const int fanRelayPin = 7; // ANTES: 11
+const int SERVO_1_PIN = 8, SERVO_2_PIN = 9;
+const int JOYSTICK_X_PIN = A0, JOYSTICK_Y_PIN = A3, JOYSTICK_SW_PIN = 2;
+
+// --- Constantes del Menú ---
+const char menuItem1[] PROGMEM = "Temp. Ventilador";
+const char menuItem2[] PROGMEM = "Luz Servo Alto";
+const char menuItem3[] PROGMEM = "Luz Servo Medio";
+const char menuItem4[] PROGMEM = "Salir del Menu";
+const char* const menuItems[] PROGMEM = { menuItem1, menuItem2, menuItem3, menuItem4 };
+const int numMenuItems = sizeof(menuItems) / sizeof(char*);
+
+// --- Estados del Programa ---
+enum ProgramState { STATE_NORMAL_DISPLAY, STATE_MENU_NAVIGATION, STATE_EDITING_VALUE };
+ProgramState currentProgramState = STATE_NORMAL_DISPLAY;
+int currentMenuItem = 0, editingParameterIndex = 0;
+
+// --- Variables Globales ---
+int highTempThreshold = 22, lightThresholdServo_1 = 750, lightThresholdServo_2 = 500;
+unsigned long highTempDuration = 10000, highTempStartTime = 0, pumpStartTime = 0;
+const unsigned long pumpDuration = 2000;
+bool fanIsOn = false, pumpIsOn = false, highTempDetected = false, oledInitialized = false;
+float currentTemperatureVal = 0, currentHumidityVal = 0;
+bool dhtError = true;
+int Luz_local_raw = 0, waterLevel_local = 0;
+long lastJoystickYMoveTime = 0, lastJoystickXMoveTime = 0, lastJoystickButtonTime = 0;
+const int joystickMoveDelay = 220, joystickButtonDelay = 300;
+const int JOY_UP_THRESHOLD = 400, JOY_DOWN_THRESHOLD = 900, JOY_PHYS_RIGHT_THRESHOLD = 400, JOY_PHYS_LEFT_THRESHOLD = 900;
+const int LDR_VALOR_CON_LUZ_BRILLANTE = 80, LDR_VALOR_CON_OSCURIDAD = 780;
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial && millis() < 3000);
+  Serial.println(F("\n--- INICIANDO HUMITURE v2.0.11 (RELES 6/7) ---"));
+  dht.begin();
+  pinMode(JOYSTICK_SW_PIN, INPUT_PULLUP);
+  pinMode(pumpRelayPin, OUTPUT); digitalWrite(pumpRelayPin, HIGH);
+  pinMode(fanRelayPin, OUTPUT); digitalWrite(fanRelayPin, HIGH);
+  pinMode(soilSensorPin, INPUT);
+  servoMotor1.attach(SERVO_1_PIN);
+  servoMotor2.attach(SERVO_2_PIN);
+  Wire.begin();
+  if (screen.begin(SSD1306_SWITCHCAPVCC, SCREEN_I2C_ADDRESS)) {
+    oledInitialized = true;
+    screen.clearDisplay(); screen.setTextSize(2); screen.setTextColor(SSD1306_WHITE);
+    screen.setCursor(10,25); screen.print(F("INICIANDO")); screen.display();
+  }
+  initProperties();
+  servoMotor1.write(posservo1); servoMotor2.write(posservo2);
+  setDebugMessageLevel(2);
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  Serial.println(F("Setup finalizado. El loop comenzara ahora..."));
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  ArduinoCloud.update();
+  handleJoystickInput();
+  static unsigned long lastLogicTime = 0;
+  if (currentTime - lastLogicTime > 2000) {
+    lastLogicTime = currentTime;
+    currentTemperatureVal = dht.readTemperature(); currentHumidityVal = dht.readHumidity();
+    dhtError = isnan(currentHumidityVal) || isnan(currentTemperatureVal);
+    Luz_local_raw = map(analogRead(photocellPin), LDR_VALOR_CON_LUZ_BRILLANTE, LDR_VALOR_CON_OSCURIDAD, 1023, 0);
+    Luz_local_raw = constrain(Luz_local_raw, 0, 1023);
+    waterLevel_local = digitalRead(soilSensorPin);
+    controlarServosPorLuz(Luz_local_raw);
+    if (!pumpIsOn && waterLevel_local == LOW) {
+      digitalWrite(pumpRelayPin, LOW); pumpIsOn = true; pumpStartTime = currentTime;
+    } else if (pumpIsOn && (currentTime - pumpStartTime >= pumpDuration || waterLevel_local == HIGH)) {
+      digitalWrite(pumpRelayPin, HIGH); pumpIsOn = false;
+    }
+    if (!dhtError) {
+      if (currentTemperatureVal >= highTempThreshold) {
+        if (!highTempDetected) { highTempDetected = true; highTempStartTime = currentTime; }
+        if (highTempDetected && (currentTime - highTempStartTime >= highTempDuration) && !fanIsOn) { digitalWrite(fanRelayPin, LOW); fanIsOn = true; }
+      } else {
+        if (highTempDetected) { highTempDetected = false; }
+        if (fanIsOn) { digitalWrite(fanRelayPin, HIGH); fanIsOn = false; }
+      }
+    } else {
+      if (fanIsOn) { digitalWrite(fanRelayPin, HIGH); fanIsOn = false; }
+      highTempDetected = false;
+    }
+    if (ArduinoCloud.connected()) {
+      if (!dhtError) { temperatura = currentTemperatureVal; humedad = currentHumidityVal; }
+      luz = (float)Luz_local_raw;
+    }
+  }
+  static unsigned long lastDisplayTime = 0;
+  if (currentProgramState == STATE_NORMAL_DISPLAY) {
+    if (currentTime - lastDisplayTime > 1000) { lastDisplayTime = currentTime; drawNormalDisplay(); }
+  } else {
+    if (currentTime - lastDisplayTime > 150) {
+      lastDisplayTime = currentTime;
+      if (currentProgramState == STATE_MENU_NAVIGATION) drawMenu();
+      else if (currentProgramState == STATE_EDITING_VALUE) drawEditScreen();
+    }
+  }
+}
+
+// ... (El resto de las funciones: drawNormalDisplay, controlarServosPorLuz, drawMenu, etc., no necesitan cambios y se omiten por brevedad, pero están incluidas en el bloque de código completo)
+void drawNormalDisplay() {
+    if (!oledInitialized) return;
+    screen.clearDisplay(); screen.setTextSize(1); screen.setTextColor(SSD1306_WHITE);
+    screen.setCursor(0, 0); screen.print(F("HUMITURE v2.0.11"));
+    screen.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
+    screen.setCursor(0, 12);
+    if (dhtError) { screen.print(F("Error en Sensor DHT11!")); } 
+    else { 
+        screen.print(F("Temp: ")); screen.print(currentTemperatureVal, 1); screen.print((char)247); screen.print(F("C")); 
+        screen.setCursor(0, 22); 
+        screen.print(F("Hum:  ")); screen.print(currentHumidityVal, 0); screen.print(F(" %")); 
+    }
+    screen.setCursor(0, 32); screen.print(F("Luz: ")); screen.print(Luz_local_raw);
+    screen.setCursor(SCREEN_WIDTH/2 + 5, 32); screen.print(F("Suelo: ")); screen.print(waterLevel_local == HIGH ? F("Humedo") : F("Seco"));
+    screen.setCursor(0, 42); screen.print(F("Vent: ")); screen.print(fanIsOn ? F("ON") : F("OFF"));
+    screen.setCursor(SCREEN_WIDTH/2 + 5, 42); screen.print(F("Bomba:")); screen.print(pumpIsOn ? F("ON") : F("OFF"));
+    screen.setCursor(0, 54);
+    screen.print(F("WiFi: "));
+    if (!ArduinoCloud.connected()) {
+        screen.print(F("Desconectado"));
+    } else {
+        long rssi = WiFi.RSSI();
+        if (rssi > -67) {
+            screen.print(F("Senal Fuerte"));
+        } else if (rssi > -80) {
+            screen.print(F("Senal Buena"));
+        } else {
+            screen.print(F("Senal Debil"));
+        }
+    }
+    screen.display();
+}
+
+void controlarServosPorLuz(int nivelDeLuz) {
+  int targetPos1, targetPos2;
+  if (nivelDeLuz > lightThresholdServo_1) { targetPos1 = 0; targetPos2 = 165; } 
+  else if (nivelDeLuz > lightThresholdServo_2) { targetPos1 = 45; targetPos2 = 125; } 
+  else { targetPos1 = 75; targetPos2 = 85; }
+  if (posservo1 != targetPos1) { posservo1 = targetPos1; }
+  if (posservo2 != targetPos2) { posservo2 = targetPos2; }
+}
+
+void drawMenu() { 
+  if (!oledInitialized) return;
+  screen.clearDisplay(); screen.setTextSize(1); screen.setTextColor(SSD1306_WHITE);
+  screen.setCursor(0, 0); screen.println(F("--- MENU AJUSTES ---"));
+  for (int i = 0; i < numMenuItems; i++) { 
+    if (i == currentMenuItem) screen.print(F("> ")); else screen.print(F("  "));
+    switch(i) {
+      case 0: screen.println(F("Temp. Ventilador")); break;
+      case 1: screen.println(F("Luz Servo Alto")); break;
+      case 2: screen.println(F("Luz Servo Medio")); break;
+      case 3: screen.println(F("Salir del Menu")); break;
+    }
+  }
+  screen.display();
+}
+
+void drawEditScreen() { 
+  if (!oledInitialized) return;
+  screen.clearDisplay(); screen.setTextSize(1); screen.setTextColor(SSD1306_WHITE);
+  screen.setCursor(0, 0); screen.print(F("Editando: ")); 
+  switch(editingParameterIndex) {
+    case 0: screen.println(F("Temp. Ventilador")); break;
+    case 1: screen.println(F("Luz Servo Alto")); break;
+    case 2: screen.println(F("Luz Servo Medio")); break;
+  }
+  screen.println(""); int currentValue = 0; String unit = "";
+  if (editingParameterIndex == 0) { currentValue = highTempThreshold; unit = " C"; }
+  else if (editingParameterIndex == 1) { currentValue = lightThresholdServo_1; }
+  else if (editingParameterIndex == 2) { currentValue = lightThresholdServo_2; }
+  screen.print(F("Valor: ")); screen.print(currentValue); screen.println(unit);
+  screen.println(F("\nX:Cambiar SW:Guardar"));
+  screen.display();
+}
+
+void handleJoystickInput() {
+    int joyX_val = analogRead(JOYSTICK_X_PIN);
+    int joyY_val = analogRead(JOYSTICK_Y_PIN);
+    bool joySW_isPressed = (digitalRead(JOYSTICK_SW_PIN) == LOW);
+    unsigned long currentTime = millis();
+    if (joySW_isPressed && (currentTime - lastJoystickButtonTime > joystickButtonDelay)) {
+        lastJoystickButtonTime = currentTime;
+        if (currentProgramState == STATE_NORMAL_DISPLAY) {
+            currentProgramState = STATE_MENU_NAVIGATION; currentMenuItem = 0;
+        } else if (currentProgramState == STATE_MENU_NAVIGATION) { 
+            if (currentMenuItem == 3) { currentProgramState = STATE_NORMAL_DISPLAY; } 
+            else { editingParameterIndex = currentMenuItem; currentProgramState = STATE_EDITING_VALUE; }
+        } else if (currentProgramState == STATE_EDITING_VALUE) {
+            currentProgramState = STATE_MENU_NAVIGATION;
+        }
+        return; 
+    }
+    if (currentProgramState == STATE_MENU_NAVIGATION) {
+        if (currentTime - lastJoystickYMoveTime > joystickMoveDelay) {
+            bool moved = false;
+            if (joyY_val < JOY_UP_THRESHOLD) { currentMenuItem--; if (currentMenuItem < 0) currentMenuItem = numMenuItems - 1; moved = true; } 
+            else if (joyY_val > JOY_DOWN_THRESHOLD) { currentMenuItem++; if (currentMenuItem >= numMenuItems) currentMenuItem = 0; moved = true; }
+            if (moved) lastJoystickYMoveTime = currentTime;
+        }
+    } else if (currentProgramState == STATE_EDITING_VALUE) {
+        if (currentTime - lastJoystickXMoveTime > joystickMoveDelay / 2) { 
+            int step = 1; if (editingParameterIndex >= 1) step = 10; 
+            bool valueChanged = false;
+            if (joyX_val < JOY_PHYS_RIGHT_THRESHOLD) { // Aumentar
+                if (editingParameterIndex == 0) highTempThreshold = constrain(highTempThreshold + step, 0, 50);
+                else if (editingParameterIndex == 1) lightThresholdServo_1 = constrain(lightThresholdServo_1 + step, 0, 1023);
+                else if (editingParameterIndex == 2) lightThresholdServo_2 = constrain(lightThresholdServo_2 + step, 0, 1023);
+                valueChanged = true;
+            } else if (joyX_val > JOY_PHYS_LEFT_THRESHOLD) { // Disminuir
+                if (editingParameterIndex == 0) highTempThreshold = constrain(highTempThreshold - step, 0, 50);
+                else if (editingParameterIndex == 1) lightThresholdServo_1 = constrain(lightThresholdServo_1 - step, 0, 1023);
+                else if (editingParameterIndex == 2) lightThresholdServo_2 = constrain(lightThresholdServo_2 - step, 0, 1023);
+                valueChanged = true;
+            }
+            if(valueChanged) lastJoystickXMoveTime = currentTime; 
+        }
+    }
+}
+
+void onPosservo1Change() { servoMotor1.write(posservo1); }
+void onPosservo2Change() { servoMotor2.write(posservo2); }
+void onTemperaturaChange() {}
+void onHumedadChange() {}
+void onLuzChange() {}
